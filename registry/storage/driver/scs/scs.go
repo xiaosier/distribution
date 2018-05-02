@@ -256,8 +256,8 @@ func (d *driver) Stat(ctx context.Context, path string) (storagedriver.FileInfo,
 			m["dec"] = "12"
 
 			month := m[strings.ToLower(dateDetail[2])]
-			timeline_use := fmt.Sprintf("%s-%s-%sT%s.000Z", dateDetail[3], month, dateDetail[1], dateDetail[4])
-			timestamp, err := time.Parse(time.RFC3339Nano, timeline_use)
+			timeUse := fmt.Sprintf("%s-%s-%sT%s.000Z", dateDetail[3], month, dateDetail[1], dateDetail[4])
+			timestamp, err := time.Parse(time.RFC3339Nano, timeUse)
 			if err != nil {
 				return nil, err
 			}
@@ -270,6 +270,70 @@ func (d *driver) Stat(ctx context.Context, path string) (storagedriver.FileInfo,
 	}
 
 	return storagedriver.FileInfoInternal{FileInfoFields: fi}, nil
+}
+
+/*list*/
+func (d *driver) List(ctx context.Context, subPath string) ([]string, error) {
+	path := subPath
+	if path != "/" && subPath[len(path)-1] != '/' {
+		path = path + "/"
+	}
+
+	prefix := ""
+	if d.scsPath("") == "" {
+		prefix = "/"
+	}
+
+	scsPath := d.scsPath(path)
+	listResponse, err := d.Bucket.ListObject(scsPath, "/", "", listMax)
+	if err != nil {
+		return nil, parseError(subPath, err)
+	}
+	files := []string{}
+	directories := []string{}
+	for {
+		var json= jsoniter.ConfigCompatibleWithStandardLibrary
+		var data= make(map[string]interface{})
+		json.Unmarshal(listResponse, &data)
+		Contents := jsoniter.Get(listResponse, "Contents")
+		CommonPrefixes := jsoniter.Get(listResponse, "CommonPrefixes")
+		if Contents.Size() == 0 && CommonPrefixes.Size() == 0 {
+			return nil, storagedriver.PathNotFoundError{Path: subPath}
+		}
+		if Contents.Size() != 0 {
+			for i := 0; i < Contents.Size(); i++ {
+				files = append(files, strings.Replace(Contents.Get(i, "Name").ToString(), d.scsPath(""), prefix, 1))
+			}
+		}
+		if CommonPrefixes.Size() != 0 {
+			for i := 0; i < CommonPrefixes.Size(); i++ {
+				tmp := CommonPrefixes.Get(i, "Prefix").ToString();
+				directories = append(directories, strings.Replace(tmp[0:len(tmp)-1], d.scsPath(""), prefix, 1))
+			}
+		}
+		if (jsoniter.Get(listResponse, "IsTruncated").ToBool()) {
+			nextMarker := jsoniter.Get(listResponse, "NextMarker").ToString()
+			listResponse, err = d.Bucket.ListObject(scsPath, "/", nextMarker, listMax)
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			break
+		}
+	}
+	// This is to cover for the cases when the first key equal to ossPath.
+	if len(files) > 0 && files[0] == strings.Replace(scsPath, d.scsPath(""), prefix, 1) {
+		files = files[1:]
+	}
+
+	if subPath != "/" {
+		if len(files) == 0 && len(directories) == 0 {
+			// Treat empty response as missing directory, since we don't actually
+			// have directories in s3.
+			return nil, storagedriver.PathNotFoundError{Path: subPath}
+		}
+	}
+	return append(files, directories...), nil
 }
 
 
