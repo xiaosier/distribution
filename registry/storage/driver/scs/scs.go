@@ -53,6 +53,7 @@ type driver struct {
 	Bucket        *scs.Bucket
 	writerPath    map[string]storagedriver.FileWriter
 	rootDirectory string
+	bucketName    string
 }
 
 type baseEmbed struct {
@@ -126,6 +127,7 @@ func New(params DriverParameters) (*Driver, error) {
 		Client:        client,
 		Bucket:        bucket,
 		writerPath:    make(map[string]storagedriver.FileWriter),
+		bucketName:    params.Bucket,
 	}
 
 	return &Driver{
@@ -334,6 +336,59 @@ func (d *driver) List(ctx context.Context, subPath string) ([]string, error) {
 		}
 	}
 	return append(files, directories...), nil
+}
+
+// Move moves an object stored at sourcePath to destPath, removing the original
+// object.
+func (d *driver) Move(ctx context.Context, sourcePath string, destPath string) error {
+	err := d.Bucket.Copy(d.scsPath(destPath), d.bucketName, d.scsPath(sourcePath))
+	if err != nil {
+		logrus.Errorf("Failed for move from %s to %s: %v", d.scsPath(sourcePath), d.scsPath(destPath), err)
+		return parseError(sourcePath, err)
+	}
+
+	return d.Delete(ctx, sourcePath)
+}
+
+func (d *driver) Delete(ctx context.Context, path string) error {
+	scsPath := d.scsPath(path)
+	listResponse, err := d.Bucket.ListObject(scsPath, "", "", listMax)
+	if err != nil {
+		return storagedriver.PathNotFoundError{Path: path}
+	}
+	for {
+		var json= jsoniter.ConfigCompatibleWithStandardLibrary
+		var data= make(map[string]interface{})
+		json.Unmarshal(listResponse, &data)
+		content := jsoniter.Get(listResponse, "Contents")
+		if content.Size() == 0 {
+			return storagedriver.PathNotFoundError{Path: path}
+		}
+
+		if content.Size() != 0 {
+			for i := 0; i < content.Size(); i++ {
+				tmpName := content.Get(i, "Name").ToString()
+				if len(tmpName) > len(scsPath) && tmpName[len(strings.TrimRight(scsPath, "/"))] != '/' {
+					// 删除/a 不删除/ab
+					break
+				}
+				err := d.Bucket.Del(tmpName)
+				if err != nil {
+					return err
+				}
+			}
+		}
+		if (jsoniter.Get(listResponse, "IsTruncated").ToBool()) {
+			nextMarker := jsoniter.Get(listResponse, "NextMarker").ToString()
+			listResponse, err = d.Bucket.ListObject(scsPath, "", nextMarker, listMax)
+			if err != nil {
+				return err
+			}
+		} else {
+			break
+		}
+	}
+	return nil
 }
 
 
