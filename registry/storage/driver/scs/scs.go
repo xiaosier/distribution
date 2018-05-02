@@ -391,6 +391,33 @@ func (d *driver) Delete(ctx context.Context, path string) error {
 	return nil
 }
 
+// URLFor returns a URL which may be used to retrieve the content stored at the given path.
+// May return an UnsupportedMethodErr in certain StorageDriver implementations.
+func (d *driver) URLFor(ctx context.Context, path string, options map[string]interface{}) (string, error) {
+	methodString := "GET"
+	method, ok := options["method"]
+	if ok {
+		methodString, ok = method.(string)
+		if !ok || (methodString != "GET") {
+			return "", storagedriver.ErrUnsupportedMethod{}
+		}
+	}
+
+	expiresTime := time.Now().Add(20 * time.Minute)
+
+	expires, ok := options["expiry"]
+	if ok {
+		et, ok := expires.(time.Time)
+		if ok {
+			expiresTime = et
+		}
+	}
+	logrus.Infof("methodString: %s, expiresTime: %v", methodString, expiresTime)
+	signedURL := d.Bucket.SignURL(d.scsPath(path), expiresTime)
+	logrus.Infof("signed URL: %s", signedURL)
+	return signedURL, nil
+}
+
 
 func (d *driver) scsPath(path string) string {
 	return strings.TrimLeft(strings.TrimRight(d.rootDirectory, "/")+path, "/")
