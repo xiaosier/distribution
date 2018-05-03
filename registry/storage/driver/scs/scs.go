@@ -538,6 +538,8 @@ func (fw *fileWriter) Push() error  {
 	if err != nil {
 		return err
 	}
+	/*if push success, remove local file*/
+	defer os.Remove(fw.file.Name())
 	return nil
 }
 
