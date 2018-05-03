@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"bufio"
 	scs "github.com/SinaCloudStorage/SinaCloudStorage-SDK-Go"
 	storagedriver "github.com/docker/distribution/registry/storage/driver"
 	"github.com/docker/distribution/registry/storage/driver/base"
@@ -17,7 +18,6 @@ import (
 	"github.com/json-iterator/go"
 	"github.com/sirupsen/logrus"
 	"os"
-	"bufio"
 	"path"
 )
 
@@ -53,6 +53,7 @@ type driver struct {
 	writerPath    map[string]storagedriver.FileWriter
 	rootDirectory string
 	bucketName    string
+	logger        *logrus.Logger
 }
 
 type baseEmbed struct {
@@ -112,8 +113,18 @@ func FromParameters(parameters map[string]interface{}) (*Driver, error) {
 
 func New(params DriverParameters) (*Driver, error) {
 
+	logger := logrus.New()
+	loggerFile, err := os.Create("scs_debug.log")
+	if err != nil {
+		logrus.Fatalln("open logger failed", err)
+	}
+	logger.Out = loggerFile
+	logger.Level = logrus.DebugLevel
+
 	client := scs.NewSCS(params.AccessKey, params.SecretKey, params.Endpoint)
 	bucket := client.Bucket(params.Bucket)
+
+	logger.Debugln(params.Bucket)
 
 	// Validate that the given credentials have at least read permissions in the
 	// given bucket scope.
@@ -126,6 +137,7 @@ func New(params DriverParameters) (*Driver, error) {
 		Bucket:     bucket,
 		writerPath: make(map[string]storagedriver.FileWriter),
 		bucketName: params.Bucket,
+		logger:     logger,
 	}
 
 	return &Driver{
@@ -170,14 +182,21 @@ func (d *driver) getContentType() string {
 
 // PutContent stores the []byte content at a location designated by "path".
 func (d *driver) PutContent(ctx context.Context, path string, contents []byte) error {
-	contentWrite := fmt.Sprintf("%s", contents)
-	return parseError(path, d.Bucket.Put(path, contentWrite, getPermissions()))
+	d.logger.WithFields(logrus.Fields{
+		"path": path,
+		"size": len(contents),
+	}).Debugln("PutContent")
+	return parseError(path, d.Bucket.PutContent(d.scsPath(path), contents, getPermissions()))
 }
 
 // Reader retrieves an io.ReadCloser for the content stored at "path" with a
 // given byte offset.
 func (d *driver) Reader(ctx context.Context, path string, offset int64) (io.ReadCloser, error) {
-
+	d.logger.WithFields(logrus.Fields{
+		"path":   path,
+		"offset": offset,
+	}).Debugln("Reader")
+	path = d.scsPath(path)
 	resp, err := d.Bucket.GetRange(path, offset)
 	if err != nil {
 		return nil, parseError(path, err)
@@ -194,6 +213,10 @@ func (d *driver) fullPath(subPath string) string {
 // Writer returns a FileWriter which will store the content written to it
 // at the location designated by "path" after the call to Commit.
 func (d *driver) Writer(ctx context.Context, subPath string, append bool) (storagedriver.FileWriter, error) {
+	d.logger.WithFields(logrus.Fields{
+		"path":   subPath,
+		"append": append,
+	}).Debugln("Writer")
 	key := d.scsPath(subPath)
 	fullPath := d.fullPath(subPath)
 	parentDir := path.Dir(fullPath)
@@ -215,7 +238,7 @@ func (d *driver) Writer(ctx context.Context, subPath string, append bool) (stora
 			return nil, err
 		}
 	} else {
-		n, err := fp.Seek(0,2)
+		n, err := fp.Seek(0, 2)
 		if err != nil {
 			fp.Close()
 			return nil, err
@@ -234,6 +257,9 @@ func (d *driver) Writer(ctx context.Context, subPath string, append bool) (stora
 // Stat retrieves the FileInfo for the given path, including the current size
 // in bytes and the creation time.
 func (d *driver) Stat(ctx context.Context, path string) (storagedriver.FileInfo, error) {
+	d.logger.WithFields(logrus.Fields{
+		"path": path,
+	}).Debugln("Stat")
 	listResponse, err := d.Bucket.ListObject(d.scsPath(path), "", "", 1)
 	if err != nil {
 		return nil, err
@@ -298,6 +324,10 @@ func (d *driver) Stat(ctx context.Context, path string) (storagedriver.FileInfo,
 
 /*list*/
 func (d *driver) List(ctx context.Context, subPath string) ([]string, error) {
+	d.logger.WithFields(logrus.Fields{
+		"path": subPath,
+	}).Debugln("List")
+
 	pathUse := subPath
 	if pathUse != "/" && subPath[len(pathUse)-1] != '/' {
 		pathUse = pathUse + "/"
@@ -363,6 +393,10 @@ func (d *driver) List(ctx context.Context, subPath string) ([]string, error) {
 // Move moves an object stored at sourcePath to destPath, removing the original
 // object.
 func (d *driver) Move(ctx context.Context, sourcePath string, destPath string) error {
+	d.logger.WithFields(logrus.Fields{
+		"sourcePath": sourcePath,
+		"destPath":   destPath,
+	}).Debugln("Move")
 	err := d.Bucket.Copy(d.scsPath(destPath), d.bucketName, d.scsPath(sourcePath))
 	if err != nil {
 		logrus.Errorf("Failed for move from %s to %s: %v", d.scsPath(sourcePath), d.scsPath(destPath), err)
@@ -373,6 +407,9 @@ func (d *driver) Move(ctx context.Context, sourcePath string, destPath string) e
 }
 
 func (d *driver) Delete(ctx context.Context, path string) error {
+	d.logger.WithFields(logrus.Fields{
+		"path": path,
+	}).Debugln("Delete")
 	scsPath := d.scsPath(path)
 	listResponse, err := d.Bucket.ListObject(scsPath, "", "", listMax)
 	if err != nil {
@@ -416,6 +453,9 @@ func (d *driver) Delete(ctx context.Context, path string) error {
 // URLFor returns a URL which may be used to retrieve the content stored at the given path.
 // May return an UnsupportedMethodErr in certain StorageDriver implementations.
 func (d *driver) URLFor(ctx context.Context, path string, options map[string]interface{}) (string, error) {
+	d.logger.WithFields(logrus.Fields{
+		"path": path,
+	}).Debugln("URLFor")
 	methodString := "GET"
 	method, ok := options["method"]
 	if ok {
@@ -470,10 +510,10 @@ type fileWriter struct {
 
 func newFileWriter(file *os.File, size int64, key string, multi *scs.Multi, parts []scs.Part) *fileWriter {
 	return &fileWriter{
-		file: file,
-		size: size,
-		bw:   bufio.NewWriter(file),
-		key:  key,
+		file:  file,
+		size:  size,
+		bw:    bufio.NewWriter(file),
+		key:   key,
 		multi: multi,
 		parts: parts,
 	}
@@ -519,7 +559,7 @@ func (fw *fileWriter) Close() error {
 	return nil
 }
 
-func (fw *fileWriter) Push() error  {
+func (fw *fileWriter) Push() error {
 	/*push part to scs*/
 	partInfo, err := fw.multi.PutPart(fw.file.Name(), scs.Private, maxChunkSize)
 	if err != nil {
@@ -539,7 +579,7 @@ func (fw *fileWriter) Push() error  {
 		return err
 	}
 	/*if push success, remove local file*/
-	defer os.Remove(fw.file.Name())
+	//defer os.Remove(fw.file.Name())
 	return nil
 }
 
