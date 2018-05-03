@@ -1,4 +1,5 @@
 package scs
+
 import (
 	"bytes"
 	"context"
@@ -6,8 +7,6 @@ import (
 	"io"
 	"io/ioutil"
 	"net/http"
-	"reflect"
-	"strconv"
 	"strings"
 	"time"
 
@@ -15,18 +14,18 @@ import (
 	storagedriver "github.com/docker/distribution/registry/storage/driver"
 	"github.com/docker/distribution/registry/storage/driver/base"
 	"github.com/docker/distribution/registry/storage/driver/factory"
-	"github.com/sirupsen/logrus"
 	"github.com/json-iterator/go"
-	"encoding/base64"
-	"encoding/json"
+	"github.com/sirupsen/logrus"
+	"os"
+	"bufio"
+	"path"
 )
 
 const (
-	driverName = "scs"
+	driverName   = "scs"
 	maxChunkSize = 4 * (1 << 20)
 	listMax      = 1000
 )
-
 
 //DriverParameters A struct that encapsulates all of the driver parameters after all values have been set
 type DriverParameters struct {
@@ -71,17 +70,16 @@ func FromParameters(parameters map[string]interface{}) (*Driver, error) {
 
 	accessKey, ok := parameters["accesskey"]
 	if !ok {
-		return nil, fmt.Errorf("No accesskey parameter provided")
+		return nil, fmt.Errorf("no accesskey parameter provided")
 	}
 	secretKey, ok := parameters["secretkey"]
 	if !ok {
-		return nil, fmt.Errorf("No secretkey parameter provided")
+		return nil, fmt.Errorf("no secretkey parameter provided")
 	}
-
 
 	bucket, ok := parameters["bucket"]
 	if !ok || fmt.Sprint(bucket) == "" {
-		return nil, fmt.Errorf("No bucket parameter provided")
+		return nil, fmt.Errorf("no bucket parameter provided")
 	}
 
 	endpoint, ok := parameters["endpoint"]
@@ -89,7 +87,7 @@ func FromParameters(parameters map[string]interface{}) (*Driver, error) {
 		endpoint = ""
 	}
 
-	RootDirectory := "";
+	RootDirectory := ""
 
 	if rootDirectory, ok := parameters["rootdirectory"]; ok {
 		if _, ok := rootDirectory.(string); ok {
@@ -124,10 +122,10 @@ func New(params DriverParameters) (*Driver, error) {
 	}
 
 	d := &driver{
-		Client:        client,
-		Bucket:        bucket,
-		writerPath:    make(map[string]storagedriver.FileWriter),
-		bucketName:    params.Bucket,
+		Client:     client,
+		Bucket:     bucket,
+		writerPath: make(map[string]storagedriver.FileWriter),
+		bucketName: params.Bucket,
 	}
 
 	return &Driver{
@@ -188,25 +186,49 @@ func (d *driver) Reader(ctx context.Context, path string, offset int64) (io.Read
 	return ioutil.NopCloser(bytes.NewReader([]byte(resp))), nil
 }
 
+func (d *driver) fullPath(subPath string) string {
+	/*Use temp path to store files*/
+	return path.Join(os.TempDir(), subPath)
+}
+
 // Writer returns a FileWriter which will store the content written to it
 // at the location designated by "path" after the call to Commit.
-func (d *driver) Writer(ctx context.Context, path string, append bool) (storagedriver.FileWriter, error) {
-	var w *writer
-	scsPath := d.scsPath(path);
-	if !append {
-		w = &writer{
-			key:           scsPath,
-			driver:        d,
-			buffer:        make([]byte, 0, maxChunkSize),
-			uploadCtxList: make([]string, 0, 1),
-		}
-		d.writerPath[scsPath] = w
-	} else {
-		w = d.writerPath[scsPath].(*writer)
-		w.closed = false
-
+func (d *driver) Writer(ctx context.Context, subPath string, append bool) (storagedriver.FileWriter, error) {
+	key := d.scsPath(subPath)
+	fullPath := d.fullPath(subPath)
+	parentDir := path.Dir(fullPath)
+	if err := os.MkdirAll(parentDir, 0777); err != nil {
+		return nil, err
 	}
-	return w, nil
+
+	fp, err := os.OpenFile(fullPath, os.O_WRONLY|os.O_CREATE, 0666)
+	if err != nil {
+		return nil, err
+	}
+
+	var offset int64
+
+	if !append {
+		err := fp.Truncate(0)
+		if err != nil {
+			fp.Close()
+			return nil, err
+		}
+	} else {
+		n, err := fp.Seek(0,2)
+		if err != nil {
+			fp.Close()
+			return nil, err
+		}
+		offset = int64(n)
+	}
+
+	multi, err := d.Bucket.InitMulti(key)
+	if err != nil {
+		return nil, err
+	}
+
+	return newFileWriter(fp, offset, key, multi, nil), nil
 }
 
 // Stat retrieves the FileInfo for the given path, including the current size
@@ -222,7 +244,7 @@ func (d *driver) Stat(ctx context.Context, path string) (storagedriver.FileInfo,
 	}
 
 	var json = jsoniter.ConfigCompatibleWithStandardLibrary
-	var data  = make(map[string]interface{})
+	var data = make(map[string]interface{})
 	json.Unmarshal(listResponse, &data)
 
 	content := jsoniter.Get(listResponse, "Contents")
@@ -276,9 +298,9 @@ func (d *driver) Stat(ctx context.Context, path string) (storagedriver.FileInfo,
 
 /*list*/
 func (d *driver) List(ctx context.Context, subPath string) ([]string, error) {
-	path := subPath
-	if path != "/" && subPath[len(path)-1] != '/' {
-		path = path + "/"
+	pathUse := subPath
+	if pathUse != "/" && subPath[len(pathUse)-1] != '/' {
+		pathUse = pathUse + "/"
 	}
 
 	prefix := ""
@@ -286,16 +308,16 @@ func (d *driver) List(ctx context.Context, subPath string) ([]string, error) {
 		prefix = "/"
 	}
 
-	scsPath := d.scsPath(path)
+	scsPath := d.scsPath(pathUse)
 	listResponse, err := d.Bucket.ListObject(scsPath, "/", "", listMax)
 	if err != nil {
 		return nil, parseError(subPath, err)
 	}
-	files := []string{}
-	directories := []string{}
+	var files []string
+	var directories []string
 	for {
-		var json= jsoniter.ConfigCompatibleWithStandardLibrary
-		var data= make(map[string]interface{})
+		json := jsoniter.ConfigCompatibleWithStandardLibrary
+		data := make(map[string]interface{})
 		json.Unmarshal(listResponse, &data)
 		Contents := jsoniter.Get(listResponse, "Contents")
 		CommonPrefixes := jsoniter.Get(listResponse, "CommonPrefixes")
@@ -309,11 +331,11 @@ func (d *driver) List(ctx context.Context, subPath string) ([]string, error) {
 		}
 		if CommonPrefixes.Size() != 0 {
 			for i := 0; i < CommonPrefixes.Size(); i++ {
-				tmp := CommonPrefixes.Get(i, "Prefix").ToString();
+				tmp := CommonPrefixes.Get(i, "Prefix").ToString()
 				directories = append(directories, strings.Replace(tmp[0:len(tmp)-1], d.scsPath(""), prefix, 1))
 			}
 		}
-		if (jsoniter.Get(listResponse, "IsTruncated").ToBool()) {
+		if jsoniter.Get(listResponse, "IsTruncated").ToBool() {
 			nextMarker := jsoniter.Get(listResponse, "NextMarker").ToString()
 			listResponse, err = d.Bucket.ListObject(scsPath, "/", nextMarker, listMax)
 			if err != nil {
@@ -357,8 +379,8 @@ func (d *driver) Delete(ctx context.Context, path string) error {
 		return storagedriver.PathNotFoundError{Path: path}
 	}
 	for {
-		var json= jsoniter.ConfigCompatibleWithStandardLibrary
-		var data= make(map[string]interface{})
+		json := jsoniter.ConfigCompatibleWithStandardLibrary
+		data := make(map[string]interface{})
 		json.Unmarshal(listResponse, &data)
 		content := jsoniter.Get(listResponse, "Contents")
 		if content.Size() == 0 {
@@ -378,7 +400,7 @@ func (d *driver) Delete(ctx context.Context, path string) error {
 				}
 			}
 		}
-		if (jsoniter.Get(listResponse, "IsTruncated").ToBool()) {
+		if jsoniter.Get(listResponse, "IsTruncated").ToBool() {
 			nextMarker := jsoniter.Get(listResponse, "NextMarker").ToString()
 			listResponse, err = d.Bucket.ListObject(scsPath, "", nextMarker, listMax)
 			if err != nil {
@@ -418,211 +440,138 @@ func (d *driver) URLFor(ctx context.Context, path string, options map[string]int
 	return signedURL, nil
 }
 
+func (d *driver) Walk(ctx context.Context, path string, f storagedriver.WalkFn) error {
+	return storagedriver.WalkFallback(ctx, d, path, f)
+}
 
 func (d *driver) scsPath(path string) string {
 	return strings.TrimLeft(strings.TrimRight(d.rootDirectory, "/")+path, "/")
-}
-
-type writer struct {
-	driver *driver
-	key    string
-	size   int64
-
-	closed    bool
-	committed bool
-	cancelled bool
-
-	buffer        []byte
-	uploadCtxList []string
 }
 
 func (d *driver) RemoveWriter(key string) {
 	delete(d.writerPath, key)
 }
 
-func (w *writer) Write(p []byte) (int, error) {
-	// w.driver.logger.WithFields(logrus.Fields{
-	// 	"key": w.key,
-	// }).Debugln("Write")
-	if w.closed {
+// writer attempts to upload parts to S3 in a buffered fashion where the last
+// part is at least as large as the chunksize, so the multipart upload could be
+// cleanly resumed in the future. This is violated if Close is called after less
+// than a full chunk is written.
+type fileWriter struct {
+	file      *os.File
+	size      int64
+	bw        *bufio.Writer
+	key       string
+	multi     *scs.Multi
+	parts     []scs.Part
+	closed    bool
+	committed bool
+	cancelled bool
+}
+
+func newFileWriter(file *os.File, size int64, key string, multi *scs.Multi, parts []scs.Part) *fileWriter {
+	return &fileWriter{
+		file: file,
+		size: size,
+		bw:   bufio.NewWriter(file),
+		key:  key,
+		multi: multi,
+		parts: parts,
+	}
+}
+
+func (fw *fileWriter) Write(p []byte) (int, error) {
+	if fw.closed {
 		return 0, fmt.Errorf("already closed")
-	} else if w.committed {
+	} else if fw.committed {
 		return 0, fmt.Errorf("already committed")
-	} else if w.cancelled {
+	} else if fw.cancelled {
 		return 0, fmt.Errorf("already cancelled")
 	}
-
-	if err := w.flushBuffer(); err != nil {
-		return 0, err
-	}
-
-	w.buffer = append(w.buffer, p...)
-	if len(w.buffer) >= maxChunkSize {
-		if err := w.flushBuffer(); err != nil {
-			return 0, err
-		}
-	}
-
-	w.size += int64(len(p))
-
-	return len(p), nil
+	n, err := fw.bw.Write(p)
+	fw.size += int64(n)
+	return n, err
 }
 
-func (w *writer) Size() int64 {
-
-	return w.size
+func (fw *fileWriter) Size() int64 {
+	return fw.size
 }
 
-func (w *writer) Close() error {
-	if w.closed {
+func (fw *fileWriter) Close() error {
+	if fw.closed {
 		return fmt.Errorf("already closed")
 	}
 
-	if err := w.flushBuffer(); err != nil {
+	if err := fw.bw.Flush(); err != nil {
 		return err
 	}
-	w.closed = true
-	return nil
-}
 
-func (w *writer) Cancel() error {
-	if w.closed {
-		return fmt.Errorf("already closed")
-	} else if w.committed {
-		return fmt.Errorf("already committed")
+	if err := fw.file.Sync(); err != nil {
+		return err
 	}
-	w.cancelled = true
+
+	if err := fw.file.Close(); err != nil {
+		return err
+	}
+	if err := fw.Push(); err != nil {
+		return err
+	}
+	fw.closed = true
 	return nil
 }
 
-func (w *writer) Commit() error {
-	defer func() {
-		w.driver.RemoveWriter(w.key)
-	}()
-	if w.closed {
+func (fw *fileWriter) Push() error  {
+	/*push part to scs*/
+	partInfo, err := fw.multi.PutPart(fw.file.Name(), scs.Private, maxChunkSize)
+	if err != nil {
+		return err
+	}
+	listPart, err := fw.multi.ListPart()
+	if err != nil {
+		return err
+	}
+	for k, v := range listPart {
+		if partInfo[k].ETag != v.ETag {
+			return fmt.Errorf("piecewise mismatch")
+		}
+	}
+	err = fw.multi.Complete(listPart)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (fw *fileWriter) Cancel() error {
+	if fw.closed {
 		return fmt.Errorf("already closed")
-	} else if w.committed {
+	}
+
+	fw.cancelled = true
+	fw.file.Close()
+	return os.Remove(fw.file.Name())
+}
+
+func (fw *fileWriter) Commit() error {
+	if fw.closed {
+		return fmt.Errorf("already closed")
+	} else if fw.committed {
 		return fmt.Errorf("already committed")
-	} else if w.cancelled {
+	} else if fw.cancelled {
 		return fmt.Errorf("already cancelled")
 	}
 
-	if err := w.flushBuffer(); err != nil {
+	if err := fw.bw.Flush(); err != nil {
 		return err
 	}
 
-	if len(w.buffer) > 0 {
-		if err := w.mkblk(bytes.NewReader(w.buffer), len(w.buffer)); err != nil {
-			return err
-		}
-	}
-
-	if err := w.mkfile(); err != nil {
+	if err := fw.file.Sync(); err != nil {
 		return err
 	}
 
-	w.committed = true
+	if err := fw.Push(); err != nil {
+		return err
+	}
+
+	fw.committed = true
 	return nil
-}
-
-func (w *writer) flushBuffer() error {
-
-	for len(w.buffer) >= maxChunkSize {
-		if err := w.mkblk(bytes.NewReader(w.buffer[:maxChunkSize]), maxChunkSize); err != nil {
-			return err
-		}
-		w.buffer = w.buffer[maxChunkSize:]
-	}
-	return nil
-}
-
-func (w *writer) mkblk(blob io.Reader, blobSize int) error {
-	url := fmt.Sprintf("%s/mkblk/%d", w.driver.client.UpHosts[0], blobSize)
-	resp, err := w.post(url, blob, blobSize)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode == 200 {
-		res := kodocli.BlkputRet{}
-		err := json.NewDecoder(resp.Body).Decode(&res)
-		if err != nil {
-			return err
-		}
-		w.uploadCtxList = append(w.uploadCtxList, res.Ctx)
-		return nil
-	}
-
-	if err := rpc.ResponseError(resp); err != nil {
-		w.driver.logger.WithError(err).Errorln("mkblk failed")
-		return err
-	}
-	return nil
-}
-
-func (w *writer) mkfile() error {
-	url := fmt.Sprintf("%s/mkfile/%d/key/%s", w.driver.client.UpHosts[0], w.size, encode(w.key))
-	buf := make([]byte, 0, 176*len(w.uploadCtxList))
-	for _, ctx := range w.uploadCtxList {
-		buf = append(buf, ctx...)
-		buf = append(buf, ',')
-	}
-	if len(buf) > 0 {
-		buf = buf[:len(buf)-1]
-	}
-	resp, err := w.post(url, bytes.NewReader(buf), len(buf))
-	if err != nil {
-		return err
-	}
-
-	if resp.StatusCode == 200 {
-		return nil
-	}
-	defer resp.Body.Close()
-	if err := rpc.ResponseError(resp); err != nil {
-		w.driver.logger.WithFields(logrus.Fields{
-			"error": err,
-			"size":  w.size,
-			"url":   url,
-		}).Errorln("mkfile failed")
-		return err
-	}
-	return nil
-}
-
-func (w *writer) post(url string, blob io.Reader, blobSize int) (*http.Response, error) {
-	resp, err := func() (*http.Response, error) {
-		req, err := http.NewRequest("POST", url, blob)
-		if err != nil {
-			return nil, err
-		}
-		policy := kodo.PutPolicy{
-			Scope:   w.driver.bucket.Name,
-			Expires: 3600,
-			UpHosts: w.driver.bucket.UpHosts,
-		}
-		token, err := w.driver.client.MakeUptokenWithSafe(&policy)
-		if err != nil {
-			return nil, err
-		}
-		req.Header.Set(http.CanonicalHeaderKey("Host"), w.driver.client.UpHosts[0])
-		req.Header.Set(http.CanonicalHeaderKey("Content-Type"), "application/octet-stream")
-		req.Header.Set(http.CanonicalHeaderKey("Content-Length"), strconv.Itoa(blobSize))
-		req.Header.Set(http.CanonicalHeaderKey("Authorization"), fmt.Sprintf("UpToken %s", token))
-		client := http.Client{}
-		return client.Do(req)
-	}()
-
-	if err != nil {
-		w.driver.logger.WithFields(logrus.Fields{
-			"url":   url,
-			"error": err,
-		}).Errorln("post failed")
-	}
-	return resp, err
-
-}
-
-func encode(raw string) string {
-	return base64.URLEncoding.EncodeToString([]byte(raw))
 }
