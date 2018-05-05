@@ -561,18 +561,13 @@ func (fw *fileWriter) Close() error {
 
 func (fw *fileWriter) Push() error {
 	/*push part to scs*/
-	partInfo, err := fw.multi.PutPart(fw.file.Name(), scs.Private, maxChunkSize)
+	_, err := fw.multi.PutPart(fw.file.Name(), scs.Private, maxChunkSize)
 	if err != nil {
 		return err
 	}
 	listPart, err := fw.multi.ListPart()
 	if err != nil {
 		return err
-	}
-	for k, v := range listPart {
-		if partInfo[k].ETag != v.ETag {
-			return fmt.Errorf("piecewise mismatch")
-		}
 	}
 	err = fw.multi.Complete(listPart)
 	if err != nil {
