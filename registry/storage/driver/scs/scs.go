@@ -9,8 +9,6 @@ import (
 	"net/http"
 	"strings"
 	"time"
-
-	"bufio"
 	scs "github.com/SinaCloudStorage/SinaCloudStorage-SDK-Go"
 	storagedriver "github.com/docker/distribution/registry/storage/driver"
 	"github.com/docker/distribution/registry/storage/driver/base"
@@ -19,6 +17,7 @@ import (
 	"github.com/sirupsen/logrus"
 	"os"
 	"path"
+	"encoding/base64"
 )
 
 const (
@@ -210,48 +209,33 @@ func (d *driver) fullPath(subPath string) string {
 	return path.Join(os.TempDir(), subPath)
 }
 
-// Writer returns a FileWriter which will store the content written to it
-// at the location designated by "path" after the call to Commit.
-func (d *driver) Writer(ctx context.Context, subPath string, append bool) (storagedriver.FileWriter, error) {
+func (d *driver) Writer(ctx context.Context, path string, append bool) (storagedriver.FileWriter, error) {
 	d.logger.WithFields(logrus.Fields{
-		"path":   subPath,
+		"path":   path,
 		"append": append,
 	}).Debugln("Writer")
-	key := d.scsPath(subPath)
-	fullPath := d.fullPath(subPath)
-	parentDir := path.Dir(fullPath)
-	if err := os.MkdirAll(parentDir, 0777); err != nil {
-		return nil, err
-	}
-
-	fp, err := os.OpenFile(fullPath, os.O_WRONLY|os.O_CREATE, 0666)
-	if err != nil {
-		return nil, err
-	}
-
-	var offset int64
-
+	var w *writer
+	scsPath := d.scsPath(path)
 	if !append {
-		err := fp.Truncate(0)
+		multi, err := d.Bucket.InitMulti(scsPath)
 		if err != nil {
-			fp.Close()
 			return nil, err
 		}
+		w = &writer{
+			key:           scsPath,
+			driver:        d,
+			buffer:        make([]byte, 0, maxChunkSize),
+			uploadCtxList: make([]scs.Part, 0, 1),
+			multi:multi,
+			number: 1,
+		}
+		d.writerPath[scsPath] = w
 	} else {
-		n, err := fp.Seek(0, 2)
-		if err != nil {
-			fp.Close()
-			return nil, err
-		}
-		offset = int64(n)
-	}
+		w = d.writerPath[scsPath].(*writer)
+		w.closed = false
 
-	multi, err := d.Bucket.InitMulti(key)
-	if err != nil {
-		return nil, err
 	}
-
-	return newFileWriter(fp, offset, key, multi, nil), nil
+	return w, nil
 }
 
 // Stat retrieves the FileInfo for the given path, including the current size
@@ -492,123 +476,158 @@ func (d *driver) RemoveWriter(key string) {
 	delete(d.writerPath, key)
 }
 
-// writer attempts to upload parts to S3 in a buffered fashion where the last
-// part is at least as large as the chunksize, so the multipart upload could be
-// cleanly resumed in the future. This is violated if Close is called after less
-// than a full chunk is written.
-type fileWriter struct {
-	file      *os.File
-	size      int64
-	bw        *bufio.Writer
-	key       string
-	multi     *scs.Multi
-	parts     []scs.Part
+type writer struct {
+	driver *driver
+	key    string
+	size   int64
+
 	closed    bool
 	committed bool
 	cancelled bool
+
+	buffer        []byte
+	uploadCtxList []scs.Part
+	multi     *scs.Multi
+	number int
 }
 
-func newFileWriter(file *os.File, size int64, key string, multi *scs.Multi, parts []scs.Part) *fileWriter {
-	return &fileWriter{
-		file:  file,
-		size:  size,
-		bw:    bufio.NewWriter(file),
-		key:   key,
-		multi: multi,
-		parts: parts,
-	}
-}
-
-func (fw *fileWriter) Write(p []byte) (int, error) {
-	if fw.closed {
+func (w *writer) Write(p []byte) (int, error) {
+	w.driver.logger.WithFields(logrus.Fields{
+	 	"key": w.key,
+	 }).Debugln("Write")
+	if w.closed {
 		return 0, fmt.Errorf("already closed")
-	} else if fw.committed {
+	} else if w.committed {
 		return 0, fmt.Errorf("already committed")
-	} else if fw.cancelled {
+	} else if w.cancelled {
 		return 0, fmt.Errorf("already cancelled")
 	}
-	n, err := fw.bw.Write(p)
-	fw.size += int64(n)
-	return n, err
+
+	if err := w.flushBuffer(); err != nil {
+		return 0, err
+	}
+
+	w.buffer = append(w.buffer, p...)
+	if len(w.buffer) >= maxChunkSize {
+		if err := w.flushBuffer(); err != nil {
+			return 0, err
+		}
+	}
+
+	w.size += int64(len(p))
+
+	return len(p), nil
 }
 
-func (fw *fileWriter) Size() int64 {
-	return fw.size
+func (w *writer) Size() int64 {
+	return w.size
 }
 
-func (fw *fileWriter) Close() error {
-	if fw.closed {
+func (w *writer) Close() error {
+	w.driver.logger.WithFields(logrus.Fields{
+		"key":    w.key,
+		"size":   w.size,
+		"buffer": len(w.buffer),
+	}).Debugln("Close")
+	if w.closed {
 		return fmt.Errorf("already closed")
 	}
 
-	if err := fw.bw.Flush(); err != nil {
+	if err := w.flushBuffer(); err != nil {
 		return err
 	}
-
-	if err := fw.file.Sync(); err != nil {
-		return err
-	}
-
-	if err := fw.file.Close(); err != nil {
-		return err
-	}
-	if err := fw.Push(); err != nil {
-		return err
-	}
-	fw.closed = true
+	w.closed = true
 	return nil
 }
 
-func (fw *fileWriter) Push() error {
-	/*push part to scs*/
-	_, err := fw.multi.PutPart(fw.file.Name(), scs.Private, maxChunkSize)
-	if err != nil {
-		return err
-	}
-	listPart, err := fw.multi.ListPart()
-	if err != nil {
-		return err
-	}
-	err = fw.multi.Complete(listPart)
-	if err != nil {
-		return err
-	}
-	/*if push success, remove local file*/
-	//defer os.Remove(fw.file.Name())
-	return nil
-}
-
-func (fw *fileWriter) Cancel() error {
-	if fw.closed {
+func (w *writer) Cancel() error {
+	w.driver.logger.WithFields(logrus.Fields{
+		"key":    w.key,
+		"size":   w.size,
+		"buffer": len(w.buffer),
+	}).Debugln("Cancel")
+	if w.closed {
 		return fmt.Errorf("already closed")
-	}
-
-	fw.cancelled = true
-	fw.file.Close()
-	return os.Remove(fw.file.Name())
-}
-
-func (fw *fileWriter) Commit() error {
-	if fw.closed {
-		return fmt.Errorf("already closed")
-	} else if fw.committed {
+	} else if w.committed {
 		return fmt.Errorf("already committed")
-	} else if fw.cancelled {
+	}
+	w.cancelled = true
+	return nil
+}
+
+func (w *writer) Commit() error {
+	defer func() {
+		w.driver.RemoveWriter(w.key)
+	}()
+	w.driver.logger.WithFields(logrus.Fields{
+		"key":    w.key,
+		"size":   w.size,
+		"buffer": len(w.buffer),
+	}).Debugln("Commit")
+	if w.closed {
+		return fmt.Errorf("already closed")
+	} else if w.committed {
+		return fmt.Errorf("already committed")
+	} else if w.cancelled {
 		return fmt.Errorf("already cancelled")
 	}
 
-	if err := fw.bw.Flush(); err != nil {
+	if err := w.flushBuffer(); err != nil {
 		return err
 	}
 
-	if err := fw.file.Sync(); err != nil {
+	if len(w.buffer) > 0 {
+		if err := w.mkblk(w.buffer); err != nil {
+			return err
+		}
+	}
+
+	if err := w.mkfile(); err != nil {
 		return err
 	}
 
-	if err := fw.Push(); err != nil {
-		return err
-	}
-
-	fw.committed = true
+	w.committed = true
 	return nil
+}
+
+func (w *writer) flushBuffer() error {
+
+	for len(w.buffer) >= maxChunkSize {
+		if err := w.mkblk(w.buffer[:maxChunkSize]); err != nil {
+			return err
+		}
+		w.buffer = w.buffer[maxChunkSize:]
+	}
+	return nil
+}
+
+/*上传分片*/
+func (w *writer) mkblk(blob []byte) error {
+	contType := http.DetectContentType(blob)
+	part, err := w.multi.PutPartSelf(blob, contType, scs.Private, w.number)
+	if err != nil {
+		w.driver.logger.WithError(err).Errorln("upload file piece error")
+		return err
+	}
+	w.number++
+	w.uploadCtxList = append(w.uploadCtxList, part)
+	return nil
+}
+
+/*合并文件*/
+func (w *writer) mkfile() error {
+	listPart, err := w.multi.ListPart()
+	if err != nil {
+		return err
+	}
+	err = w.multi.Complete(listPart)
+	if err != nil {
+		w.driver.logger.WithError(err).Errorln("complete file piece error")
+		return err
+	}
+	return nil
+}
+
+func encode(raw string) string {
+	return base64.URLEncoding.EncodeToString([]byte(raw))
 }
